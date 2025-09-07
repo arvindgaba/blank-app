@@ -1,10 +1,10 @@
 # combined_nifty_atm0909_vwap.py
 # NIFTY ΔOI Imbalance + TradingView VWAP alert
-# - ATM: TV 09:09 → Yahoo daily open (robust, no-verify) → NSE underlying (provisional)
+# - ATM: TV 09:09 → NSE underlying (provisional)
 # - TV loop immediately upgrades ATM when 09:09 appears
 # - Manual ATM override in sidebar
 # - OC loop reloads ATM store every cycle
-# - Weekday neighbors: Fri/Sat/Sun ±5, Mon ±4, Tue ±3, Wed ±2, Thu ±1
+# - Weekday neighbors logic updated for TUESDAY expiry
 # - VWAP 15m session from TV 1m candles
 # - Full logging + CSV/text outputs
 
@@ -13,7 +13,6 @@ import pandas as pd
 import streamlit as st
 from streamlit_autorefresh import st_autorefresh
 import plotly.express as px
-#import yfinance as yf
 import certifi
 import requests, urllib3
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
@@ -30,6 +29,7 @@ ATM_STORE_PATH       = OUT_DIR / "nifty_atm_store.json"
 LOG_PATH             = OUT_DIR / "nifty_app.log"
 VWAP_NOW_TXT         = OUT_DIR / "nifty_vwap_now.txt"
 VWAP_LOG_CSV         = OUT_DIR / "nifty_vwap_log.csv"
+CHANGELOG_PATH       = pathlib.Path("changelog_v0.6.md") # Path to the new changelog file
 
 MAX_NEIGHBORS_LIMIT  = 20
 IMBALANCE_TRIGGER    = 30.0         # %
@@ -518,9 +518,9 @@ def compute_period_vwap(df_1m: pd.DataFrame, period_len: int = 14) -> float | No
 
 # ---------------- Weekday neighbors mapping ----------------
 def neighbors_by_weekday(d: dt.date) -> int:
-    # Fri/Sat/Sun -> ±5, Mon -> ±4, Tue -> ±3, Wed -> ±2, Thu -> ±1
+    # Expiry TUESDAY: Tue ±1, Mon/Wed ±2, Thu ±3, Fri/Sat/Sun ±4
     wd = d.weekday()  # Mon=0 .. Sun=6
-    mapping = {0: 4, 1: 3, 2: 2, 3: 1, 4: 5, 5: 5, 6: 5}
+    mapping = {0: 2, 1: 1, 2: 2, 3: 3, 4: 4, 5: 4, 6: 4}
     return mapping.get(wd, 3)
 
 def nearest_strike_block(strikes_sorted: list[int], atm: int, neighbors_each: int) -> list[int]:
@@ -597,21 +597,15 @@ def build_df_with_imbalance(raw: dict, store: dict):
         atm_strike = int(stored_atm)
         atm_status = stored_status
         base_val   = store.get("base_value", 0.0)
-        """
-        if atm_status != "captured-0909" and atm_status != "manual-override":
-            y_a, y_b, y_s = capture_today_atm_yahoo_open()
-            if y_a is not None and atm_strike != y_a:
-                log.info("Correcting ATM via Yahoo: %s → %s", atm_strike, y_a)
-                atm_strike, base_val, atm_status = y_a, y_b, y_s
-                update_store_atm(atm_strike, base_val, atm_status)
-        """
         log.info("Using ATM: %s (%s)", atm_strike, atm_status)
 
     # neighbors by weekday rule
     neighbors_each = neighbors_by_weekday(today_date)
     neighbors_each = min(neighbors_each, MAX_NEIGHBORS_LIMIT)
     wanted = set(nearest_strike_block(strikes_all, atm_strike, neighbors_each))
-    log.info("Neighbors: weekday=%s ±%s, wanted_count=%s", today_date.weekday(), neighbors_each, len(wanted))
+    log.info("Neighbors: weekday=%s (day %d) -> ±%s neighbors, wanted_count=%s", 
+             today_date.strftime('%A'), today_date.weekday(), neighbors_each, len(wanted))
+
 
     for c in ("CE.changeinOpenInterest", "PE.changeinOpenInterest"):
         if c not in df_all.columns:
@@ -1213,8 +1207,8 @@ k5.metric("Imbalance (PUTS − CALLS)", f"{imbalance_pct:,.2f}%")
 
 # VWAP/Spot caption
 if vwap_latest is not None and spot is not None:
-    #st.caption(f"VWAP15m: **{vwap_latest:,.2f}**  •  Spot: **{spot:,.2f}**  •  Diff: **{spot - vwap_latest:+.2f}**")
-    st.caption(f"VWAP15-period: **{vwap_latest:,.2f}**  •  Spot: **{spot:,.2f}**  •  Diff: **{spot - vwap_latest:+.2f}**")
+    #st.caption(f"VWAP15m: **{vwap_latest:,.2f}** •  Spot: **{spot:,.2f}** •  Diff: **{spot - vwap_latest:+.2f}**")
+    st.caption(f"VWAP15-period: **{vwap_latest:,.2f}** •  Spot: **{spot:,.2f}** •  Diff: **{spot - vwap_latest:+.2f}**")
 else:
     st.caption("VWAP or Spot not available yet. Check logs if this persists.")
 
@@ -1334,14 +1328,14 @@ st.divider()
 col_footer1, col_footer2, col_footer3 = st.columns([2, 1, 1])
 
 with col_footer1:
-    st.caption("🚀 **NFS LIVE v0.5** - NIFTY Options Chain Analysis with VWAP Alerts & Telegram Integration")
+    st.caption("🚀 **NFS LIVE v0.6** - NIFTY Options Chain Analysis with VWAP Alerts & Telegram Integration")
     st.caption("⚠️ **Disclaimer**: This tool is for educational purposes only. Trade at your own risk.")
 
 with col_footer2:
     if st.button("📝 View Changelog", help="View complete version history and changes"):
         # Read and display changelog content
         try:
-            changelog_content = pathlib.Path("changelog.md").read_text(encoding="utf-8")
+            changelog_content = CHANGELOG_PATH.read_text(encoding="utf-8")
             st.text_area("📝 Changelog", changelog_content, height=400, help="Complete version history")
         except Exception as e:
             st.error(f"Could not load changelog: {e}")
