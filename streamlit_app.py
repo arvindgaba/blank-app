@@ -1,10 +1,10 @@
 # combined_nifty_atm0909_vwap.py
 # NIFTY ΔOI Imbalance + TradingView VWAP alert
-# - ATM: TV 09:09 → Yahoo daily open (robust, no-verify) → NSE underlying (provisional)
+# - ATM: TV 09:09 → NSE underlying (provisional)
 # - TV loop immediately upgrades ATM when 09:09 appears
 # - Manual ATM override in sidebar
 # - OC loop reloads ATM store every cycle
-# - Weekday neighbors: Fri/Sat/Sun ±5, Mon ±4, Tue ±3, Wed ±2, Thu ±1
+# - Weekday neighbors logic updated for TUESDAY expiry
 # - VWAP 15m session from TV 1m candles
 # - Full logging + CSV/text outputs
 
@@ -13,7 +13,6 @@ import pandas as pd
 import streamlit as st
 from streamlit_autorefresh import st_autorefresh
 import plotly.express as px
-#import yfinance as yf
 import certifi
 import requests, urllib3
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
@@ -30,6 +29,7 @@ ATM_STORE_PATH       = OUT_DIR / "nifty_atm_store.json"
 LOG_PATH             = OUT_DIR / "nifty_app.log"
 VWAP_NOW_TXT         = OUT_DIR / "nifty_vwap_now.txt"
 VWAP_LOG_CSV         = OUT_DIR / "nifty_vwap_log.csv"
+CHANGELOG_PATH       = pathlib.Path("changelog_v0.8.md") # Path to the new changelog file
 
 MAX_NEIGHBORS_LIMIT  = 20
 IMBALANCE_TRIGGER    = 30.0         # %
@@ -42,7 +42,7 @@ TV_PASSWORD          = "1dE6Land@123"
 
 # ---- TELEGRAM SETTINGS ----
 TELEGRAM_BOT_TOKEN   = "1849589360:AAFW_O3pxt6NZJvoV-NeUMfqu90wIyP8bSA"
-TELEGRAM_CHAT_ID     = "1887957750"
+TELEGRAM_CHAT_IDS    = ["1887957750", "5045651468"]  # Multiple chat IDs for alerts
 TELEGRAM_API_URL     = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
 # ===========================
 
@@ -96,22 +96,32 @@ log = setup_logger()
 
 # ---------------- Telegram Alert Function ----------------
 def send_telegram_alert(message: str) -> bool:
-    """Send alert message to Telegram. Returns True if successful."""
-    try:
-        payload = {
-            'chat_id': TELEGRAM_CHAT_ID,
-            'text': message,
-            'parse_mode': 'HTML'
-        }
-        response = requests.post(TELEGRAM_API_URL, data=payload, timeout=10)
-        if response.status_code == 200:
-            log.info("Telegram alert sent successfully")
-            return True
-        else:
-            log.error("Telegram alert failed: HTTP %s - %s", response.status_code, response.text)
-            return False
-    except Exception as e:
-        log.error("Telegram alert exception: %s", e)
+    """Send alert message to multiple Telegram chat IDs. Returns True if at least one succeeds."""
+    success_count = 0
+    total_chats = len(TELEGRAM_CHAT_IDS)
+    
+    for chat_id in TELEGRAM_CHAT_IDS:
+        try:
+            payload = {
+                'chat_id': chat_id,
+                'text': message,
+                'parse_mode': 'HTML'
+            }
+            response = requests.post(TELEGRAM_API_URL, data=payload, timeout=10)
+            if response.status_code == 200:
+                log.info("Telegram alert sent successfully to chat_id: %s", chat_id)
+                success_count += 1
+            else:
+                log.error("Telegram alert failed for chat_id %s: HTTP %s - %s", 
+                         chat_id, response.status_code, response.text)
+        except Exception as e:
+            log.error("Telegram alert exception for chat_id %s: %s", chat_id, e)
+    
+    if success_count > 0:
+        log.info("Telegram alert sent to %d/%d chat IDs successfully", success_count, total_chats)
+        return True
+    else:
+        log.error("Telegram alert failed for all %d chat IDs", total_chats)
         return False
 
 def format_vwap_alert_message(alert: str, spot: float, vwap: float, suggestion: str, 
@@ -508,9 +518,9 @@ def compute_period_vwap(df_1m: pd.DataFrame, period_len: int = 14) -> float | No
 
 # ---------------- Weekday neighbors mapping ----------------
 def neighbors_by_weekday(d: dt.date) -> int:
-    # Fri/Sat/Sun -> ±5, Mon -> ±4, Tue -> ±3, Wed -> ±2, Thu -> ±1
+    # Expiry TUESDAY: Tue ±1, Mon/Wed ±2, Thu ±3, Fri/Sat/Sun ±4
     wd = d.weekday()  # Mon=0 .. Sun=6
-    mapping = {0: 4, 1: 3, 2: 2, 3: 1, 4: 5, 5: 5, 6: 5}
+    mapping = {0: 2, 1: 1, 2: 2, 3: 3, 4: 4, 5: 4, 6: 4}
     return mapping.get(wd, 3)
 
 def nearest_strike_block(strikes_sorted: list[int], atm: int, neighbors_each: int) -> list[int]:
@@ -582,26 +592,25 @@ def build_df_with_imbalance(raw: dict, store: dict):
             if a is not None:
                 atm_strike, base_val, atm_status = a,b,s
                 break
-        update_store_atm(atm_strike, base_val, atm_status)
+        if atm_strike is not None:
+            update_store_atm(atm_strike, base_val, atm_status)
+        else:
+            log.error("Failed to capture ATM for today.")
+            # Handle the case where ATM capture fails
+            return pd.DataFrame(), None
     else:
         atm_strike = int(stored_atm)
         atm_status = stored_status
         base_val   = store.get("base_value", 0.0)
-        """
-        if atm_status != "captured-0909" and atm_status != "manual-override":
-            y_a, y_b, y_s = capture_today_atm_yahoo_open()
-            if y_a is not None and atm_strike != y_a:
-                log.info("Correcting ATM via Yahoo: %s → %s", atm_strike, y_a)
-                atm_strike, base_val, atm_status = y_a, y_b, y_s
-                update_store_atm(atm_strike, base_val, atm_status)
-        """
         log.info("Using ATM: %s (%s)", atm_strike, atm_status)
 
     # neighbors by weekday rule
     neighbors_each = neighbors_by_weekday(today_date)
     neighbors_each = min(neighbors_each, MAX_NEIGHBORS_LIMIT)
     wanted = set(nearest_strike_block(strikes_all, atm_strike, neighbors_each))
-    log.info("Neighbors: weekday=%s ±%s, wanted_count=%s", today_date.weekday(), neighbors_each, len(wanted))
+    log.info("Neighbors: weekday=%s (day %d) -> ±%s neighbors, wanted_count=%s", 
+             today_date.strftime('%A'), today_date.weekday(), neighbors_each, len(wanted))
+
 
     for c in ("CE.changeinOpenInterest", "PE.changeinOpenInterest"):
         if c not in df_all.columns:
@@ -1203,8 +1212,8 @@ k5.metric("Imbalance (PUTS − CALLS)", f"{imbalance_pct:,.2f}%")
 
 # VWAP/Spot caption
 if vwap_latest is not None and spot is not None:
-    #st.caption(f"VWAP15m: **{vwap_latest:,.2f}**  •  Spot: **{spot:,.2f}**  •  Diff: **{spot - vwap_latest:+.2f}**")
-    st.caption(f"VWAP15-period: **{vwap_latest:,.2f}**  •  Spot: **{spot:,.2f}**  •  Diff: **{spot - vwap_latest:+.2f}**")
+    #st.caption(f"VWAP15m: **{vwap_latest:,.2f}** •  Spot: **{spot:,.2f}** •  Diff: **{spot - vwap_latest:+.2f}**")
+    st.caption(f"VWAP15-period: **{vwap_latest:,.2f}** •  Spot: **{spot:,.2f}** •  Diff: **{spot - vwap_latest:+.2f}**")
 else:
     st.caption("VWAP or Spot not available yet. Check logs if this persists.")
 
@@ -1324,14 +1333,14 @@ st.divider()
 col_footer1, col_footer2, col_footer3 = st.columns([2, 1, 1])
 
 with col_footer1:
-    st.caption("🚀 **NFS LIVE v0.5** - NIFTY Options Chain Analysis with VWAP Alerts & Telegram Integration")
+    st.caption("🚀 **NFS LIVE v0.8** - NIFTY Options Chain Analysis with VWAP Alerts & Telegram Integration")
     st.caption("⚠️ **Disclaimer**: This tool is for educational purposes only. Trade at your own risk.")
 
 with col_footer2:
     if st.button("📝 View Changelog", help="View complete version history and changes"):
         # Read and display changelog content
         try:
-            changelog_content = pathlib.Path("changelog.md").read_text(encoding="utf-8")
+            changelog_content = CHANGELOG_PATH.read_text(encoding="utf-8")
             st.text_area("📝 Changelog", changelog_content, height=400, help="Complete version history")
         except Exception as e:
             st.error(f"Could not load changelog: {e}")
