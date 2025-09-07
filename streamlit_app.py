@@ -11,6 +11,7 @@
 import os, json, time, base64, datetime as dt, pathlib, threading, warnings, logging, sys, math, random
 import pandas as pd
 import streamlit as st
+from streamlit_autorefresh import st_autorefresh
 import plotly.express as px
 import certifi
 import requests, urllib3
@@ -28,7 +29,7 @@ ATM_STORE_PATH       = OUT_DIR / "nifty_atm_store.json"
 LOG_PATH             = OUT_DIR / "nifty_app.log"
 VWAP_NOW_TXT         = OUT_DIR / "nifty_vwap_now.txt"
 VWAP_LOG_CSV         = OUT_DIR / "nifty_vwap_log.csv"
-CHANGELOG_PATH       = pathlib.Path("changelog_v0.7.md") # Path to the new changelog file
+CHANGELOG_PATH       = pathlib.Path("changelog_v0.8.md") # Path to the new changelog file
 
 MAX_NEIGHBORS_LIMIT  = 20
 IMBALANCE_TRIGGER    = 30.0         # %
@@ -1012,9 +1013,7 @@ def play_beep_once_on_new_alert(mem: StoreMem, alert_text: str):
 
 # ---------------- Streamlit UI ----------------
 st.set_page_config(page_title="NIFTY ΔOI Imbalance + TV VWAP Alert", layout="wide")
-
-# Auto-refresh the page
-st.markdown(f'<meta http-equiv="refresh" content="{int(AUTOREFRESH_MS / 1000)}">', unsafe_allow_html=True)
+st_autorefresh(interval=AUTOREFRESH_MS, key="nifty_autorefresh")
 
 # Start background processes
 mem = start_background()
@@ -1334,7 +1333,7 @@ st.divider()
 col_footer1, col_footer2, col_footer3 = st.columns([2, 1, 1])
 
 with col_footer1:
-    st.caption("🚀 **NFS LIVE v0.7** - NIFTY Options Chain Analysis with VWAP Alerts & Telegram Integration")
+    st.caption("🚀 **NFS LIVE v0.8** - NIFTY Options Chain Analysis with VWAP Alerts & Telegram Integration")
     st.caption("⚠️ **Disclaimer**: This tool is for educational purposes only. Trade at your own risk.")
 
 with col_footer2:
