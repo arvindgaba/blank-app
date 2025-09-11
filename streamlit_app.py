@@ -7,6 +7,7 @@
 # - Weekday neighbors logic updated for TUESDAY expiry
 # - VWAP 15m session from TV 1m candles
 # - Full logging + CSV/text outputs
+# - Version 2.5.2 fixes and enhancements
 
 import os, json, time, base64, datetime as dt, pathlib, threading, warnings, logging, sys, math, random
 from streamlit_autorefresh import st_autorefresh
@@ -18,6 +19,7 @@ import requests, urllib3
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 # ================= USER SETTINGS =================
+APP_VERSION          = "2.5.2"
 SYMBOL               = "NIFTY"
 FETCH_EVERY_SECONDS  = 60          # option-chain poll (1 min)
 TV_FETCH_SECONDS     = 60           # TradingView poll (1 min)
@@ -29,7 +31,7 @@ ATM_STORE_PATH       = OUT_DIR / "nifty_atm_store.json"
 LOG_PATH             = OUT_DIR / "nifty_app.log"
 VWAP_NOW_TXT         = OUT_DIR / "nifty_vwap_now.txt"
 VWAP_LOG_CSV         = OUT_DIR / "nifty_vwap_log.csv"
-CHANGELOG_PATH       = pathlib.Path("changelog_v0.7.md") # Path to the new changelog file
+CHANGELOG_PATH       = pathlib.Path("changelog.md") # Path to the new changelog file
 
 MAX_NEIGHBORS_LIMIT  = 20
 IMBALANCE_TRIGGER    = 30.0         # %
@@ -99,7 +101,7 @@ def send_telegram_alert(message: str) -> bool:
     """Send alert message to multiple Telegram chat IDs. Returns True if at least one succeeds."""
     success_count = 0
     total_chats = len(TELEGRAM_CHAT_IDS)
-    
+
     for chat_id in TELEGRAM_CHAT_IDS:
         try:
             payload = {
@@ -112,11 +114,11 @@ def send_telegram_alert(message: str) -> bool:
                 log.info("Telegram alert sent successfully to chat_id: %s", chat_id)
                 success_count += 1
             else:
-                log.error("Telegram alert failed for chat_id %s: HTTP %s - %s", 
+                log.error("Telegram alert failed for chat_id %s: HTTP %s - %s",
                          chat_id, response.status_code, response.text)
         except Exception as e:
             log.error("Telegram alert exception for chat_id %s: %s", chat_id, e)
-    
+
     if success_count > 0:
         log.info("Telegram alert sent to %d/%d chat IDs successfully", success_count, total_chats)
         return True
@@ -124,17 +126,17 @@ def send_telegram_alert(message: str) -> bool:
         log.error("Telegram alert failed for all %d chat IDs", total_chats)
         return False
 
-def format_vwap_alert_message(alert: str, spot: float, vwap: float, suggestion: str, 
-                             atm_strike: int, expiry: str, imbalance_pct: float, 
+def format_vwap_alert_message(alert: str, spot: float, vwap: float, suggestion: str,
+                             atm_strike: int, expiry: str, imbalance_pct: float,
                              timestamp: str) -> str:
     """Format a comprehensive VWAP alert message for Telegram."""
-    
+
     # Determine alert emoji
     emoji = "🚨" if "BUY" in suggestion else "📊"
     direction_emoji = "📈" if "CALL" in suggestion else "📉" if "PUT" in suggestion else "⚪"
-    
+
     message = f"""
-{emoji} <b>NFS LIVE v1.0 - VWAP ALERT</b> {emoji}
+{emoji} <b>NFS LIVE v{APP_VERSION} - VWAP ALERT</b> {emoji}
 
 {direction_emoji} <b>Signal:</b> {suggestion}
 📍 <b>Alert:</b> {alert}
@@ -154,7 +156,7 @@ def format_vwap_alert_message(alert: str, spot: float, vwap: float, suggestion: 
 
 <i>Trade at your own risk. This is for educational purposes only.</i>
     """.strip()
-    
+
     return message
 
 def now_ist() -> dt.datetime:
@@ -245,32 +247,52 @@ def new_session():
     return s
 
 def pick_current_week_expiry(raw: dict) -> str | None:
+    """
+    Selects the nearest weekly (Tuesday) expiry. Falls back to the soonest
+    available future date if no Tuesday is found (for monthlys/holidays).
+    """
     today = now_ist().date()
-    parsed: list[tuple[str, dt.date]] = []
-    for s in raw.get("records", {}).get("expiryDates", []):
+    parsed = []
+    expiry_dates = raw.get("records", {}).get("expiryDates", [])
+    if not expiry_dates:
+        log.error("No expiryDates in JSON from NSE.")
+        return None
+
+    for s in expiry_dates:
         try:
             parsed.append((s, dt.datetime.strptime(s, "%d-%b-%Y").date()))
         except Exception:
             pass
+    
     if not parsed:
-        log.error("No expiryDates in JSON.")
+        log.error("Could not parse any expiry dates.")
         return None
-    # Prefer the nearest Tuesday (weekday==1) on/after today
-    tue_future = [p for p in parsed if p[1] >= today and p[1].weekday() == 1]
-    if tue_future:
-        return min(tue_future, key=lambda x: x[1])[0]
-    # If no future Tuesday is listed, choose the earliest Tuesday available
-    tue_all = [p for p in parsed if p[1].weekday() == 1]
-    if tue_all:
-        return min(tue_all, key=lambda x: x[1])[0]
-    # Fallback: previous behavior (nearest future), then absolute earliest
-    future = [p for p in parsed if p[1] >= today]
-    chosen = min(future, key=lambda x: x[1]) if future else min(parsed, key=lambda x: x[1])
-    return chosen[0]
+
+    future_expiries = [p for p in parsed if p[1] >= today]
+    if not future_expiries:
+        log.warning("No future expiry dates found. Using the latest available past expiry.")
+        return parsed[-1][0] if parsed else None
+
+    # SEBI RULE CHANGE: Look for Tuesday (weekday == 1)
+    tuesday_expiries = [p for p in future_expiries if p[1].weekday() == 1]
+
+    if tuesday_expiries:
+        chosen = min(tuesday_expiries, key=lambda x: x[1])
+        log.info(f"Selected Tuesday expiry: {chosen[0]}")
+        return chosen[0]
+    else:
+        # Fallback for monthly expiry weeks or holidays
+        chosen = min(future_expiries, key=lambda x: x[1])
+        log.warning(f"No Tuesday expiry found. Using soonest available future date: {chosen[0]}")
+        return chosen[0]
 
 
 def round_to_50(x: float) -> int:
     return int(round(x / 50.0) * 50)
+
+@st.cache_resource
+def oc_session_cached():
+    return new_session()
 
 def fetch_raw_option_chain():
     s = oc_session_cached()
@@ -298,7 +320,7 @@ def fetch_raw_option_chain():
         # if we’re struggling, rebuild the session once
         if i == 2:
             try:
-                oc_session_cached.cache_clear()
+                oc_session_cached.clear_cache()
                 s = oc_session_cached()
                 log.info("Recreated NSE session")
             except Exception as ee:
@@ -311,7 +333,7 @@ def fetch_raw_option_chain():
 # ---------------- TradingView helpers ----------------
 def tv_login():
     #from tvDatafeed import TvDatafeed
-    from tvDatafeed import TvDatafeed, Interval 
+    from tvDatafeed import TvDatafeed, Interval
     try:
         tv = TvDatafeed(username="dileep.marchetty@gmail.com", password="1dE6Land@123")
         log.info("Logged in to TradingView as %s", TV_USERNAME)
@@ -320,15 +342,9 @@ def tv_login():
         log.error("TradingView login failed: %s", e)
         raise
 
-from functools import lru_cache
-
-@lru_cache(maxsize=1)
+@st.cache_resource
 def tv_login_cached():
     return tv_login()
-
-@lru_cache(maxsize=1)
-def oc_session_cached():
-    return new_session()
 
 def fetch_tv_1m_session(n_bars: int = 500):   # was 2000
     try:
@@ -627,7 +643,7 @@ def build_df_with_imbalance(raw: dict, store: dict):
     neighbors_each = neighbors_by_weekday(today_date)
     neighbors_each = min(neighbors_each, MAX_NEIGHBORS_LIMIT)
     wanted = set(nearest_strike_block(strikes_all, atm_strike, neighbors_each))
-    log.info("Neighbors: weekday=%s (day %d) -> ±%s neighbors, wanted_count=%s", 
+    log.info("Neighbors: weekday=%s (day %d) -> ±%s neighbors, wanted_count=%s",
              today_date.strftime('%A'), today_date.weekday(), neighbors_each, len(wanted))
 
 
@@ -706,7 +722,7 @@ class SignalHistory:
         self.signals: list[dict] = []
         self.history_file = OUT_DIR / "signal_history.json"
         self.load_history()
-    
+
     def load_history(self):
         """Load existing signal history from file."""
         try:
@@ -719,7 +735,7 @@ class SignalHistory:
         except Exception as e:
             log.error("Failed to load signal history: %s", e)
             self.signals = []
-    
+
     def save_history(self):
         """Save signal history to file."""
         try:
@@ -728,14 +744,14 @@ class SignalHistory:
                 json.dump(self.signals, f, indent=2)
         except Exception as e:
             log.error("Failed to save signal history: %s", e)
-    
-    def add_signal(self, alert: str, spot: float, vwap: float, suggestion: str, 
-                   atm_strike: int, expiry: str, imbalance_pct: float, 
+
+    def add_signal(self, alert: str, spot: float, vwap: float, suggestion: str,
+                   atm_strike: int, expiry: str, imbalance_pct: float,
                    telegram_sent: bool = False):
         """Add a new buy signal to history."""
         timestamp_ist = now_ist()
         timestamp_uae = timestamp_ist.astimezone(UAE)
-        
+
         signal_data = {
             'id': len(self.signals) + 1,
             'date': timestamp_ist.date().isoformat(),
@@ -751,18 +767,18 @@ class SignalHistory:
             'imbalance_pct': round(float(imbalance_pct), 2),
             'telegram_sent': telegram_sent
         }
-        
+
         with self.lock:
             self.signals.append(signal_data)
             self.save_history()
-        
+
         log.info("Signal added to history: %s at %s IST", suggestion, signal_data['timestamp_ist'])
-    
+
     def get_today_signals(self) -> list[dict]:
         """Get all signals for today."""
         with self.lock:
             return self.signals.copy()
-    
+
     def to_dataframe(self) -> pd.DataFrame:
         """Convert signals to DataFrame for display."""
         with self.lock:
@@ -821,26 +837,30 @@ def option_chain_loop(mem: StoreMem):
     while True:
         try:
             raw = fetch_raw_option_chain()
-            df, meta = build_df_with_imbalance(raw, {})
-            if not df.empty:
-                # ── NEW: record today’s Imbalance % point ──────────────────
-                imb_pct = meta.get("imbalance_pct")          # <- lives in meta
-                if imb_pct is not None:
-                    mem.intraday.add_point(now_ist(), float(imb_pct))
+            if raw:
+                df, meta = build_df_with_imbalance(raw, {})
+                if not df.empty:
+                    # ── NEW: record today’s Imbalance % point ──────────────────
+                    imb_pct = meta.get("imbalance_pct")          # <- lives in meta
+                    if imb_pct is not None:
+                        mem.intraday.add_point(now_ist(), float(imb_pct))
 
-                # ── existing code (shared-memory, CSV, logging) ────────────
-                with mem.lock:
-                    mem.df_opt  = df
-                    mem.meta_opt = dict(meta)
-                    mem.last_opt = now_ist()
-                try:
-                    df.to_csv(CSV_PATH, index=False)
-                except Exception as e:
-                    log.error("Write CSV failed: %s", e)
+                    # ── existing code (shared-memory, CSV, logging) ────────────
+                    with mem.lock:
+                        mem.df_opt  = df
+                        mem.meta_opt = dict(meta)
+                        mem.last_opt = now_ist()
+                    try:
+                        df.to_csv(CSV_PATH, index=False)
+                    except Exception as e:
+                        log.error("Write CSV failed: %s", e)
 
-                log.info("[OC] wrote %d rows", len(df))
+                    log.info("[OC] wrote %d rows", len(df))
+                else:
+                    log.warning("[OC] empty dataframe this cycle")
             else:
-                log.warning("[OC] empty dataframe this cycle")
+                log.warning("[OC] fetch failed, empty raw data")
+
 
         except Exception as e:
             log.exception("OptionChain loop error: %s", e)
@@ -900,16 +920,17 @@ def tradingview_loop(mem: StoreMem):
 
                     # refresh imbalance immediately
                     raw_now = fetch_raw_option_chain()
-                    df_now, meta_now = build_df_with_imbalance(raw_now, {})
-                    if not df_now.empty:
-                        with mem.lock:
-                            mem.df_opt   = df_now.copy()
-                            mem.meta_opt = dict(meta_now)
-                            mem.last_opt = now_ist()
-                        try:
-                            df_now.to_csv(CSV_PATH, index=False)
-                        except Exception as e:
-                            log.error("CSV write failed (TV-trigger): %s", e)
+                    if raw_now:
+                        df_now, meta_now = build_df_with_imbalance(raw_now, {})
+                        if not df_now.empty:
+                            with mem.lock:
+                                mem.df_opt   = df_now.copy()
+                                mem.meta_opt = dict(meta_now)
+                                mem.last_opt = now_ist()
+                            try:
+                                df_now.to_csv(CSV_PATH, index=False)
+                            except Exception as e:
+                                log.error("CSV write failed (TV-trigger): %s", e)
 
             # ── 3) VWAP-with-period (from 15-minute bars) -------------------
             vwap_latest = None
@@ -955,7 +976,7 @@ def tradingview_loop(mem: StoreMem):
                     expiry = meta.get("expiry", "Unknown")
                     imbalance_pct = meta.get("imbalance_pct", 0.0)
                     timestamp = now_ist().strftime("%Y-%m-%d %H:%M:%S")
-                    
+
                     # Format and send Telegram message
                     telegram_message = format_vwap_alert_message(
                         alert=alert,
@@ -967,7 +988,7 @@ def tradingview_loop(mem: StoreMem):
                         imbalance_pct=float(imbalance_pct),
                         timestamp=timestamp
                     )
-                    
+
                     telegram_success = send_telegram_alert(telegram_message)
                     if telegram_success:
                         with mem.lock:
@@ -975,7 +996,7 @@ def tradingview_loop(mem: StoreMem):
                         log.info("Telegram alert sent for: %s", alert)
                     else:
                         log.error("Failed to send Telegram alert for: %s", alert)
-                    
+
                     # Add signal to history
                     mem.signal_history.add_signal(
                         alert=alert,
@@ -987,7 +1008,7 @@ def tradingview_loop(mem: StoreMem):
                         imbalance_pct=float(imbalance_pct),
                         telegram_sent=telegram_success
                     )
-                        
+
                 except Exception as e:
                     log.error("Error preparing/sending Telegram alert: %s", e)
 
@@ -1031,7 +1052,7 @@ def play_beep_once_on_new_alert(mem: StoreMem, alert_text: str):
         mem.last_alert_key = key
 
 # ---------------- Streamlit UI ----------------
-st.set_page_config(page_title="NFS v0.8.2", layout="wide")
+st.set_page_config(page_title=f"NFS v{APP_VERSION}", layout="wide")
 
 # Auto-refresh the page
 #st.markdown(f'<meta http-equiv="refresh" content="{int(AUTOREFRESH_MS / 1000)}">', unsafe_allow_html=True)
@@ -1061,14 +1082,14 @@ with st.sidebar:
     st.divider()
     st.subheader("Telegram Alert Test")
     st.caption("Test Telegram functionality during off-market hours")
-    
+
     if st.button("Send Test Alert"):
         try:
             # Get current data or use mock data if not available
             with mem.lock:
                 current_meta = dict(mem.meta_opt) if mem.meta_opt else {}
                 current_vwap = mem.vwap_latest
-            
+
             # Use real data if available, otherwise mock data for testing
             spot = current_meta.get("underlying", 24500.0)  # Mock spot price
             vwap = current_vwap if current_vwap else 24485.0  # Mock VWAP
@@ -1076,11 +1097,11 @@ with st.sidebar:
             expiry = current_meta.get("expiry", "09-Jan-2025")  # Mock expiry
             imbalance_pct = current_meta.get("imbalance_pct", -35.5)  # Mock imbalance
             suggestion = current_meta.get("suggestion", "BUY PUT")  # Mock suggestion
-            
+
             # Create test alert message
             test_alert = f"{suggestion} (TEST ALERT - spot near VWAP ±{VWAP_TOLERANCE_PTS})"
             timestamp = now_ist().strftime("%Y-%m-%d %H:%M:%S")
-            
+
             telegram_message = format_vwap_alert_message(
                 alert=test_alert,
                 spot=float(spot),
@@ -1091,17 +1112,17 @@ with st.sidebar:
                 imbalance_pct=float(imbalance_pct),
                 timestamp=timestamp
             )
-            
+
             if send_telegram_alert(telegram_message):
                 st.success("✅ Test Telegram alert sent successfully!")
                 log.info("Manual test Telegram alert sent")
             else:
                 st.error("❌ Failed to send test Telegram alert. Check logs.")
-                
+
         except Exception as e:
             st.error(f"❌ Error sending test alert: {e}")
             log.error("Manual test Telegram alert failed: %s", e)
-    
+
     if st.button("Send Simple Test Message"):
         try:
             simple_message = f"""
@@ -1114,13 +1135,13 @@ This is a simple test to verify Telegram connectivity.
 
 <i>If you receive this message, Telegram integration is working correctly.</i>
             """.strip()
-            
+
             if send_telegram_alert(simple_message):
                 st.success("✅ Simple test message sent successfully!")
                 log.info("Simple test Telegram message sent")
             else:
                 st.error("❌ Failed to send simple test message. Check logs.")
-                
+
         except Exception as e:
             st.error(f"❌ Error sending simple test: {e}")
             log.error("Simple test Telegram message failed: %s", e)
@@ -1141,7 +1162,7 @@ with mem.lock:
     last_tv = mem.last_tv
     vwap_alert = mem.vwap_alert
 
-st.title("NIFTY Change in OI — Imbalance + VWAP Alert (TradingView)")
+st.title(f"NIFTY Change in OI — Imbalance + VWAP Alert (v{APP_VERSION})")
 
 # Current Time Display
 current_time = now_ist()
@@ -1167,10 +1188,10 @@ st.divider()
 
 # Status row
 c1, c2, c3, c4, c5 = st.columns(5)
-c1.metric("Last OC pull", 
-          format_time_compact(last_opt) if last_opt else "—", 
+c1.metric("Last OC pull",
+          format_time_compact(last_opt) if last_opt else "—",
           help="Option Chain data fetch time")
-c2.metric("Last TV pull", 
+c2.metric("Last TV pull",
           format_time_compact(last_tv) if last_tv else "—",
           help="TradingView data fetch time")
 c3.metric("Spot (underlying)", f"{meta.get('underlying', float('nan')):,.2f}" if meta else "—")
@@ -1318,13 +1339,13 @@ if signal_df.empty:
 else:
     # Display the signals in reverse chronological order (latest first)
     display_df = signal_df.iloc[::-1].copy()
-    
+
     # Format the display columns
     display_columns = [
-        'ID', 'Time (IST)', 'Time (UAE)', 'Signal', 'Spot Price', 'VWAP', 
+        'ID', 'Time (IST)', 'Time (UAE)', 'Signal', 'Spot Price', 'VWAP',
         'Difference', 'ATM Strike', 'Expiry', 'OI Imbalance %', 'Telegram Sent'
     ]
-    
+
     display_df_formatted = pd.DataFrame({
         'ID': display_df['id'],
         'Time (IST)': display_df['timestamp_ist'].str.split(' ').str[1],  # Show only time part
@@ -1338,9 +1359,9 @@ else:
         'OI Imbalance %': display_df['imbalance_pct'].apply(lambda x: f"{x:+.2f}%"),
         'Telegram Sent': display_df['telegram_sent'].apply(lambda x: "✅" if x else "❌")
     })
-    
+
     st.dataframe(display_df_formatted, use_container_width=True, hide_index=True)
-    
+
     # Summary stats
     total_signals = len(display_df)
     telegram_success = display_df['telegram_sent'].sum()
@@ -1355,7 +1376,7 @@ st.divider()
 col_footer1, col_footer2, col_footer3 = st.columns([2, 1, 1])
 
 with col_footer1:
-    st.caption("🚀 **NFS LIVE v0.8.2** - NIFTY Options Chain Analysis with VWAP Alerts & Telegram Integration")
+    st.caption(f"🚀 **NFS LIVE v{0.8.3}** - NIFTY Options Chain Analysis with VWAP Alerts & Telegram Integration")
     st.caption("⚠️ **Disclaimer**: This tool is for educational purposes only. Trade at your own risk.")
 
 with col_footer2:
@@ -1369,6 +1390,6 @@ with col_footer2:
 
 with col_footer3:
     st.caption("**Quick Links:**")
-    st.caption("• [Logs]({}) 📋".format(LOG_PATH))
-    st.caption("• [VWAP Data]({}) 📊".format(VWAP_NOW_TXT))
-    st.caption("• [CSV Output]({}) 📁".format(CSV_PATH))
+    st.caption(f"• [Logs]({LOG_PATH}) 📋")
+    st.caption(f"• [VWAP Data]({VWAP_NOW_TXT}) 📊")
+    st.caption(f"• [CSV Output]({CSV_PATH}) 📁")
