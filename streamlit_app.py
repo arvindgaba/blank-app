@@ -787,8 +787,7 @@ def play_beep_once_on_new_alert(mem: StoreMem, alert_text: str):
 # ---------------- Streamlit UI ----------------
 def main():
     st.set_page_config(page_title=f"NFS LIVE v{APP_VERSION}", layout="wide")
-    st.markdown(f'<meta http-equiv="refresh" content="{int(AUTOREFRESH_MS / 1000)}">', unsafe_allow_html=True)
-
+    #st.markdown(f'<meta http-equiv="refresh" content="{int(AUTOREFRESH_MS / 1000)}">', unsafe_allow_html=True)
     mem = start_background()
 
     with st.sidebar:
