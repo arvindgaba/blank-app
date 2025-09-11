@@ -1376,7 +1376,7 @@ st.divider()
 col_footer1, col_footer2, col_footer3 = st.columns([2, 1, 1])
 
 with col_footer1:
-    st.caption(f"🚀 **NFS LIVE v{0.8.3}** - NIFTY Options Chain Analysis with VWAP Alerts & Telegram Integration")
+    st.caption(f"🚀 **NFS LIVE v0.8.3** - NIFTY Options Chain Analysis with VWAP Alerts & Telegram Integration")
     st.caption("⚠️ **Disclaimer**: This tool is for educational purposes only. Trade at your own risk.")
 
 with col_footer2:
