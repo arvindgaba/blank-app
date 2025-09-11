@@ -9,6 +9,7 @@
 # - Full logging + CSV/text outputs
 
 import os, json, time, base64, datetime as dt, pathlib, threading, warnings, logging, sys, math, random
+from streamlit_autorefresh import st_autorefresh
 import pandas as pd
 import streamlit as st
 import plotly.express as px
@@ -1030,10 +1031,11 @@ def play_beep_once_on_new_alert(mem: StoreMem, alert_text: str):
         mem.last_alert_key = key
 
 # ---------------- Streamlit UI ----------------
-st.set_page_config(page_title="NIFTY ΔOI Imbalance + TV VWAP Alert", layout="wide")
+st.set_page_config(page_title="NFS v0.8.2", layout="wide")
 
 # Auto-refresh the page
-st.markdown(f'<meta http-equiv="refresh" content="{int(AUTOREFRESH_MS / 1000)}">', unsafe_allow_html=True)
+#st.markdown(f'<meta http-equiv="refresh" content="{int(AUTOREFRESH_MS / 1000)}">', unsafe_allow_html=True)
+st_autorefresh(interval=AUTOREFRESH_MS, key="nfs_autorefresh")
 
 # Start background processes
 mem = start_background()
@@ -1353,7 +1355,7 @@ st.divider()
 col_footer1, col_footer2, col_footer3 = st.columns([2, 1, 1])
 
 with col_footer1:
-    st.caption("🚀 **NFS LIVE v0.8.1** - NIFTY Options Chain Analysis with VWAP Alerts & Telegram Integration")
+    st.caption("🚀 **NFS LIVE v0.8.2** - NIFTY Options Chain Analysis with VWAP Alerts & Telegram Integration")
     st.caption("⚠️ **Disclaimer**: This tool is for educational purposes only. Trade at your own risk.")
 
 with col_footer2:
