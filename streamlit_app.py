@@ -7,7 +7,7 @@
 # - Weekday neighbors logic updated for TUESDAY expiry
 # - VWAP 15m session from TV 1m candles
 # - Full logging + CSV/text outputs
-# - Version 2.5.2 fixes and enhancements
+# - Version 2.5.4 fixes and enhancements
 
 import os, json, time, base64, datetime as dt, pathlib, threading, warnings, logging, sys, math, random
 from streamlit_autorefresh import st_autorefresh
@@ -19,7 +19,7 @@ import requests, urllib3
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 # ================= USER SETTINGS =================
-APP_VERSION          = "2.5.2"
+APP_VERSION          = "0.8.3"
 SYMBOL               = "NIFTY"
 FETCH_EVERY_SECONDS  = 60          # option-chain poll (1 min)
 TV_FETCH_SECONDS     = 60           # TradingView poll (1 min)
@@ -320,7 +320,7 @@ def fetch_raw_option_chain():
         # if we’re struggling, rebuild the session once
         if i == 2:
             try:
-                oc_session_cached.clear_cache()
+                oc_session_cached.clear()
                 s = oc_session_cached()
                 log.info("Recreated NSE session")
             except Exception as ee:
@@ -1199,7 +1199,7 @@ c4.metric("VWAP (15-min period)", f"{vwap_latest:,.2f}" if vwap_latest else "—
 c5.metric("VWAP tolerance", f"±{VWAP_tol:.0f} pts")
 
 if df_live is None or df_live.empty:
-    st.warning("Waiting for first successful option-chain fetch…")
+    st.warning("Waiting for first successful option-chain fetch... (Note: NSE API is likely unavailable outside market hours)")
     st.stop()
 
 expiry = meta.get("expiry", str(df_live["Expiry"].iloc[0]))
@@ -1376,7 +1376,7 @@ st.divider()
 col_footer1, col_footer2, col_footer3 = st.columns([2, 1, 1])
 
 with col_footer1:
-    st.caption(f"🚀 **NFS LIVE v0.8.3** - NIFTY Options Chain Analysis with VWAP Alerts & Telegram Integration")
+    st.caption(f"🚀 **NFS LIVE v{APP_VERSION}** - NIFTY Options Chain Analysis with VWAP Alerts & Telegram Integration")
     st.caption("⚠️ **Disclaimer**: This tool is for educational purposes only. Trade at your own risk.")
 
 with col_footer2:
@@ -1393,3 +1393,4 @@ with col_footer3:
     st.caption(f"• [Logs]({LOG_PATH}) 📋")
     st.caption(f"• [VWAP Data]({VWAP_NOW_TXT}) 📊")
     st.caption(f"• [CSV Output]({CSV_PATH}) 📁")
+
