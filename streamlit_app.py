@@ -9,6 +9,7 @@
 # - Full logging + CSV/text outputs
 
 import os, json, time, base64, datetime as dt, pathlib, threading, warnings, logging, sys, math, random
+from streamlit_autorefresh import st_autorefresh
 from functools import lru_cache
 import pandas as pd
 import streamlit as st
@@ -788,6 +789,7 @@ def play_beep_once_on_new_alert(mem: StoreMem, alert_text: str):
 def main():
     st.set_page_config(page_title=f"NFS LIVE v{APP_VERSION}", layout="wide")
     #st.markdown(f'<meta http-equiv="refresh" content="{int(AUTOREFRESH_MS / 1000)}">', unsafe_allow_html=True)
+    st_autorefresh(interval=AUTOREFRESH_MS, key="nfs_autorefresh")
     mem = start_background()
 
     with st.sidebar:
