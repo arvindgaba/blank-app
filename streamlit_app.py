@@ -9,6 +9,7 @@
 # - Full logging + CSV/text outputs
 
 import os, json, time, base64, datetime as dt, pathlib, threading, warnings, logging, sys, math, random
+from functools import lru_cache
 import pandas as pd
 import streamlit as st
 import plotly.express as px
