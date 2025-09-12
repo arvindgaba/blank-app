@@ -7,7 +7,7 @@
 # - Weekday neighbors logic updated for TUESDAY expiry
 # - VWAP 15m session from TV 1m candles
 # - Full logging + CSV/text outputs
-# - Version 2.5.4 fixes and enhancements
+# - Version 2.5.6 fixes and enhancements
 
 import os, json, time, base64, datetime as dt, pathlib, threading, warnings, logging, sys, math, random
 from streamlit_autorefresh import st_autorefresh
@@ -19,10 +19,10 @@ import requests, urllib3
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 # ================= USER SETTINGS =================
-APP_VERSION          = "0.8.3"
+APP_VERSION          = "2.5.6"
 SYMBOL               = "NIFTY"
-FETCH_EVERY_SECONDS  = 60          # option-chain poll (1 min)
-TV_FETCH_SECONDS     = 60           # TradingView poll (1 min)
+FETCH_EVERY_SECONDS  = 90          # option-chain poll (1.5 min)
+TV_FETCH_SECONDS     = 90           # TradingView poll (1.5 min)
 AUTOREFRESH_MS       = 10_000
 
 OUT_DIR              = pathlib.Path.home() / "Documents" / "NSE_output"
@@ -52,10 +52,15 @@ API_URL  = "https://www.nseindia.com/api/option-chain-indices"
 IST      = dt.timezone(dt.timedelta(hours=5, minutes=30))
 UAE      = dt.timezone(dt.timedelta(hours=4))
 
+# --- NEW: List of User-Agents to rotate ---
+USER_AGENTS = [
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/108.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/107.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/108.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/108.0.0.0 Safari/537.36",
+]
+
 BASE_HEADERS = {
-    "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                   "AppleWebKit/537.36 (KHTML, like Gecko) "
-                   "Chrome/124.0 Safari/537.36"),
     "Accept-Language": "en-US,en;q=0.9",
     "Accept": "application/json, text/plain, */*",
     "X-Requested-With": "XMLHttpRequest",
@@ -239,7 +244,14 @@ def new_session():
         import requests as _rq
         s = _rq.Session()
         log.warning("cloudscraper not installed; using requests.Session")
-    s.headers.update(BASE_HEADERS)
+
+    # --- UPDATED: Randomize User-Agent ---
+    headers = BASE_HEADERS.copy()
+    headers["User-Agent"] = random.choice(USER_AGENTS)
+    s.headers.update(headers)
+    log.info(f"Using User-Agent: {headers['User-Agent']}")
+    # ------------------------------------
+
     try:
         s.get(f"https://www.nseindia.com/option-chain?symbol={SYMBOL}", timeout=8)
     except Exception as e:
@@ -297,15 +309,17 @@ def oc_session_cached():
 def fetch_raw_option_chain():
     s = oc_session_cached()
     last_err = None
-    for i in range(6):
+    last_status_code = None
+    for i in range(3): # Reduced retries to fail faster on persistent blocks
         try:
             r = s.get(API_URL, params={"symbol": SYMBOL}, timeout=10)
+            last_status_code = r.status_code
             if r.status_code == 200:
                 try:
                     raw = r.json()
                     if "records" in raw and "data" in raw["records"]:
                         log.info("OC fetch OK on attempt %d", i+1)
-                        return raw
+                        return raw, 200
                     log.warning("OC JSON missing keys on attempt %d", i+1)
                 except json.JSONDecodeError as e:
                     log.warning("OC JSON decode error on attempt %d: %s", i+1, e)
@@ -317,17 +331,8 @@ def fetch_raw_option_chain():
 
         time.sleep(2)
 
-        # if we’re struggling, rebuild the session once
-        if i == 2:
-            try:
-                oc_session_cached.clear()
-                s = oc_session_cached()
-                log.info("Recreated NSE session")
-            except Exception as ee:
-                log.warning("Failed to recreate NSE session: %s", ee)
-
     log.error("OC fetch failed after retries: %s", last_err)
-    return None
+    return None, last_status_code
 
 
 # ---------------- TradingView helpers ----------------
@@ -834,18 +839,29 @@ class IntradayImbSeries:
 
 def option_chain_loop(mem: StoreMem):
     OUT_DIR.mkdir(parents=True, exist_ok=True)
+    consecutive_failures = 0
+    blocked_until = None
+
     while True:
         try:
-            raw = fetch_raw_option_chain()
+            now = now_ist()
+            if blocked_until and now < blocked_until:
+                log.warning(f"[OC] In cool-down period due to NSE block. Retrying after {blocked_until.strftime('%H:%M:%S')}.")
+                time.sleep(60)
+                continue
+            
+            blocked_until = None # Reset block if we are past the time
+
+            raw, status_code = fetch_raw_option_chain()
+
             if raw:
+                consecutive_failures = 0 # Reset on success
                 df, meta = build_df_with_imbalance(raw, {})
                 if not df.empty:
-                    # ── NEW: record today’s Imbalance % point ──────────────────
-                    imb_pct = meta.get("imbalance_pct")          # <- lives in meta
+                    imb_pct = meta.get("imbalance_pct")
                     if imb_pct is not None:
                         mem.intraday.add_point(now_ist(), float(imb_pct))
 
-                    # ── existing code (shared-memory, CSV, logging) ────────────
                     with mem.lock:
                         mem.df_opt  = df
                         mem.meta_opt = dict(meta)
@@ -860,12 +876,20 @@ def option_chain_loop(mem: StoreMem):
                     log.warning("[OC] empty dataframe this cycle")
             else:
                 log.warning("[OC] fetch failed, empty raw data")
-
+                if status_code == 403:
+                    consecutive_failures += 1
+                    log.warning(f"[OC] Consecutive failures: {consecutive_failures}")
+            
+            if consecutive_failures >= 3:
+                blocked_until = now_ist() + dt.timedelta(minutes=15)
+                log.error(f"[OC] Detected 3 consecutive 403 errors. Tripping circuit breaker. Pausing requests until {blocked_until.strftime('%H:%M:%S')}.")
+                consecutive_failures = 0 # Reset after tripping
 
         except Exception as e:
             log.exception("OptionChain loop error: %s", e)
 
-        time.sleep(FETCH_EVERY_SECONDS)
+        sleep_time = FETCH_EVERY_SECONDS + random.uniform(0, 15)
+        time.sleep(sleep_time)
 
 
 def write_vwap_files(stamp: str, vwap_latest: float | None, spot: float | None, suggestion: str):
@@ -873,7 +897,6 @@ def write_vwap_files(stamp: str, vwap_latest: float | None, spot: float | None, 
         OUT_DIR.mkdir(parents=True, exist_ok=True)
         v = f"{vwap_latest:.2f}" if vwap_latest is not None else "NA"
         s = f"{float(spot):.2f}" if spot is not None else "NA"
-        #VWAP_NOW_TXT.write_text(f"{stamp} IST | VWAP15m={v} | Spot={s} | Signal={suggestion}\n")
         VWAP_NOW_TXT.write_text(f"{stamp} IST | VWAP15period={v} | Spot={s} | Signal={suggestion}\n")
         header_needed = not VWAP_LOG_CSV.exists()
         with VWAP_LOG_CSV.open("a", encoding="utf-8") as f:
@@ -883,26 +906,12 @@ def write_vwap_files(stamp: str, vwap_latest: float | None, spot: float | None, 
     except Exception as e:
         log.error("VWAP file write failed: %s", e)
 
-# ---------------------------------------------------------------------------
-# Trading-View worker thread
-# • still pulls the 1-minute feed for 09 : 09 ATM logic
-# • pulls an *independent* 15-minute feed that is used **only** for VWAP-with-period
-# ---------------------------------------------------------------------------
 def tradingview_loop(mem: StoreMem):
-    """
-    1. Fetch BOTH 1-minute and 15-minute NIFTY candles every TV_FETCH_SECONDS.
-    2. Use the 1-minute feed for the 09:09 ATM upgrade just as before.
-    3. Calculate VWAP-with-period from the 15-minute feed (period_len = 1),
-       so it matches TradingView’s “VWAP (Length = 1)” applied to a 15-min chart.
-    4. Persist the result, evaluate alerts, log, and sleep.
-    """
     while True:
         try:
-            # ── 1) Pull latest data ──────────────────────────────────────────
-            df_1m  = fetch_tv_1m_session()          # unchanged – for ATM logic
-            df_15m = fetch_tv_15m_session()         # NEW – 15-minute bars
+            df_1m  = fetch_tv_1m_session()
+            df_15m = fetch_tv_15m_session()
 
-            # ── 2) Instant ATM upgrade from 1-minute feed -------------------
             px909 = price_at_0909(df_1m) if df_1m is not None else None
             if px909:
                 base_val  = float(px909)
@@ -918,8 +927,7 @@ def tradingview_loop(mem: StoreMem):
                     update_store_atm(atm_guess, base_val, "captured-0909")
                     log.info("ATM upgraded to %s (base %.2f) by TV-loop", atm_guess, base_val)
 
-                    # refresh imbalance immediately
-                    raw_now = fetch_raw_option_chain()
+                    raw_now, _ = fetch_raw_option_chain() # Discard status code here
                     if raw_now:
                         df_now, meta_now = build_df_with_imbalance(raw_now, {})
                         if not df_now.empty:
@@ -932,24 +940,15 @@ def tradingview_loop(mem: StoreMem):
                             except Exception as e:
                                 log.error("CSV write failed (TV-trigger): %s", e)
 
-            # ── 3) VWAP-with-period (from 15-minute bars) -------------------
             vwap_latest = None
             if df_15m is not None:
-                # we only want the most-recent 15-minute candle,
-                # so use period_len = 1 against 15-minute data
                 vwap_latest = compute_tv_vwap(df_15m, period_len=14)
-
-                # OPTIONAL DIAGNOSTIC: show the bar we just used
                 log.debug("15-min bar for VWAP:\n%s", df_15m.tail(1).to_string())
 
-            # ── 4) Store in shared memory -----------------------------------
             with mem.lock:
                 mem.last_tv     = now_ist()
-                mem.vwap_latest = vwap_latest      # what the UI reads
-                # keep the name you were already using for anything else:
-                mem.latest_vwap_period15 = vwap_latest
+                mem.vwap_latest = vwap_latest
 
-            # ── 5) Alert logic ----------------------------------------------
             with mem.lock:
                 meta = mem.meta_opt or {}
                 spot = meta.get("underlying")
@@ -967,17 +966,13 @@ def tradingview_loop(mem: StoreMem):
             with mem.lock:
                 mem.vwap_alert = alert
 
-            # ── 6) Telegram Alert Logic ------------------------------------
-            # Send Telegram alert if we have a valid alert and it's different from the last one
             if alert != "NO ALERT" and alert != mem.last_telegram_alert:
                 try:
-                    # Get additional data for comprehensive alert
                     atm_strike = meta.get("atm", 0)
                     expiry = meta.get("expiry", "Unknown")
                     imbalance_pct = meta.get("imbalance_pct", 0.0)
                     timestamp = now_ist().strftime("%Y-%m-%d %H:%M:%S")
 
-                    # Format and send Telegram message
                     telegram_message = format_vwap_alert_message(
                         alert=alert,
                         spot=float(spot),
@@ -997,7 +992,6 @@ def tradingview_loop(mem: StoreMem):
                     else:
                         log.error("Failed to send Telegram alert for: %s", alert)
 
-                    # Add signal to history
                     mem.signal_history.add_signal(
                         alert=alert,
                         spot=float(spot),
@@ -1012,7 +1006,6 @@ def tradingview_loop(mem: StoreMem):
                 except Exception as e:
                     log.error("Error preparing/sending Telegram alert: %s", e)
 
-            # ── 7) Persist snapshot & write one-line log --------------------
             stamp = now_ist().strftime("%Y-%m-%d %H:%M:%S")
             write_vwap_files(stamp, vwap_latest, spot, sugg)
 
@@ -1026,7 +1019,8 @@ def tradingview_loop(mem: StoreMem):
                 mem.vwap_latest = None
             log.exception("TradingView loop error: %s", e)
 
-        time.sleep(TV_FETCH_SECONDS)
+        sleep_time = TV_FETCH_SECONDS + random.uniform(0, 15)
+        time.sleep(sleep_time)
 
 
 
@@ -1054,14 +1048,10 @@ def play_beep_once_on_new_alert(mem: StoreMem, alert_text: str):
 # ---------------- Streamlit UI ----------------
 st.set_page_config(page_title=f"NFS v{APP_VERSION}", layout="wide")
 
-# Auto-refresh the page
-#st.markdown(f'<meta http-equiv="refresh" content="{int(AUTOREFRESH_MS / 1000)}">', unsafe_allow_html=True)
 st_autorefresh(interval=AUTOREFRESH_MS, key="nfs_autorefresh")
 
-# Start background processes
 mem = start_background()
 
-# Sidebar thresholds
 with st.sidebar:
     st.header("Settings")
     VWAP_tol = st.number_input("VWAP tolerance (pts)", value=float(VWAP_TOLERANCE_PTS), step=1.0)
@@ -1085,37 +1075,29 @@ with st.sidebar:
 
     if st.button("Send Test Alert"):
         try:
-            # Get current data or use mock data if not available
             with mem.lock:
                 current_meta = dict(mem.meta_opt) if mem.meta_opt else {}
                 current_vwap = mem.vwap_latest
 
-            # Use real data if available, otherwise mock data for testing
-            spot = current_meta.get("underlying", 24500.0)  # Mock spot price
-            vwap = current_vwap if current_vwap else 24485.0  # Mock VWAP
-            atm_strike = current_meta.get("atm", 24500)  # Mock ATM
-            expiry = current_meta.get("expiry", "09-Jan-2025")  # Mock expiry
-            imbalance_pct = current_meta.get("imbalance_pct", -35.5)  # Mock imbalance
-            suggestion = current_meta.get("suggestion", "BUY PUT")  # Mock suggestion
+            spot = current_meta.get("underlying", 24500.0)
+            vwap = current_vwap if current_vwap else 24485.0
+            atm_strike = current_meta.get("atm", 24500)
+            expiry = current_meta.get("expiry", "09-Jan-2025")
+            imbalance_pct = current_meta.get("imbalance_pct", -35.5)
+            suggestion = current_meta.get("suggestion", "BUY PUT")
 
-            # Create test alert message
             test_alert = f"{suggestion} (TEST ALERT - spot near VWAP ±{VWAP_TOLERANCE_PTS})"
             timestamp = now_ist().strftime("%Y-%m-%d %H:%M:%S")
 
             telegram_message = format_vwap_alert_message(
-                alert=test_alert,
-                spot=float(spot),
-                vwap=float(vwap),
-                suggestion=suggestion,
-                atm_strike=int(atm_strike),
-                expiry=expiry,
-                imbalance_pct=float(imbalance_pct),
+                alert=test_alert, spot=float(spot), vwap=float(vwap),
+                suggestion=suggestion, atm_strike=int(atm_strike),
+                expiry=expiry, imbalance_pct=float(imbalance_pct),
                 timestamp=timestamp
             )
 
             if send_telegram_alert(telegram_message):
                 st.success("✅ Test Telegram alert sent successfully!")
-                log.info("Manual test Telegram alert sent")
             else:
                 st.error("❌ Failed to send test Telegram alert. Check logs.")
 
@@ -1127,24 +1109,18 @@ with st.sidebar:
         try:
             simple_message = f"""
 🧪 <b>TELEGRAM TEST MESSAGE</b> 🧪
-
 This is a simple test to verify Telegram connectivity.
-
 🕐 <b>Time (IST):</b> {now_ist().strftime("%Y-%m-%d %H:%M:%S")}
 🇦🇪 <b>Time (UAE):</b> {now_uae().strftime("%Y-%m-%d %H:%M:%S")}
-
 <i>If you receive this message, Telegram integration is working correctly.</i>
             """.strip()
 
             if send_telegram_alert(simple_message):
                 st.success("✅ Simple test message sent successfully!")
-                log.info("Simple test Telegram message sent")
             else:
                 st.error("❌ Failed to send simple test message. Check logs.")
-
         except Exception as e:
             st.error(f"❌ Error sending simple test: {e}")
-            log.error("Simple test Telegram message failed: %s", e)
 
     st.divider()
     if st.button("Show last 80 log lines"):
@@ -1164,11 +1140,9 @@ with mem.lock:
 
 st.title(f"NIFTY Change in OI — Imbalance + VWAP Alert (v{APP_VERSION})")
 
-# Current Time Display
 current_time = now_ist()
 current_uae = current_time.astimezone(UAE)
 
-# Create 5 columns for better layout
 col_time1, col_time2, col_time3, col_time4, col_time5 = st.columns([1, 1, 1, 1, 1])
 
 with col_time1:
@@ -1186,14 +1160,9 @@ with col_time5:
 
 st.divider()
 
-# Status row
 c1, c2, c3, c4, c5 = st.columns(5)
-c1.metric("Last OC pull",
-          format_time_compact(last_opt) if last_opt else "—",
-          help="Option Chain data fetch time")
-c2.metric("Last TV pull",
-          format_time_compact(last_tv) if last_tv else "—",
-          help="TradingView data fetch time")
+c1.metric("Last OC pull", format_time_compact(last_opt), help="Option Chain data fetch time")
+c2.metric("Last TV pull", format_time_compact(last_tv), help="TradingView data fetch time")
 c3.metric("Spot (underlying)", f"{meta.get('underlying', float('nan')):,.2f}" if meta else "—")
 c4.metric("VWAP (15-min period)", f"{vwap_latest:,.2f}" if vwap_latest else "—")
 c5.metric("VWAP tolerance", f"±{VWAP_tol:.0f} pts")
@@ -1216,14 +1185,12 @@ puts_pct = meta.get("puts_pct", float(df_live["PUTS %"].iloc[0]))
 calls_pct= meta.get("calls_pct",float(df_live["CALLS %"].iloc[0]))
 spot     = meta.get("underlying", None)
 
-# Apply sidebar thresholds for display
 imbalance_ok = abs(imbalance_pct) > IMB_thr
 vwap_ok = (vwap_latest is not None and spot is not None and abs(float(spot) - float(vwap_latest)) <= VWAP_tol)
 combined_alert = "NO ALERT"
 if suggestion in ("BUY CALL", "BUY PUT") and imbalance_ok and vwap_ok:
     combined_alert = f"{suggestion} (spot near VWAP ±{VWAP_tol})"
 
-# Banner + sound
 if combined_alert != "NO ALERT":
     st.success(f"VWAP ALERT: **{combined_alert}**", icon="✅")
     with mem.lock:
@@ -1234,7 +1201,6 @@ else:
 st.subheader(f"Expiry: {expiry}")
 base_disp = f"{base_value:,.2f}" if isinstance(base_value, (int, float)) else "—"
 
-# Convert updated_str to datetime for dual timezone display
 try:
     updated_dt = dt.datetime.strptime(updated_str, "%Y-%m-%d %H:%M:%S").replace(tzinfo=IST)
     updated_display = format_datetime_compact(updated_dt)
@@ -1253,9 +1219,7 @@ k3.metric("PUTS %", f"{puts_pct:,.2f}%")
 k4.metric("CALLS %", f"{calls_pct:,.2f}%")
 k5.metric("Imbalance (PUTS − CALLS)", f"{imbalance_pct:,.2f}%")
 
-# VWAP/Spot caption
 if vwap_latest is not None and spot is not None:
-    #st.caption(f"VWAP15m: **{vwap_latest:,.2f}** •  Spot: **{spot:,.2f}** •  Diff: **{spot - vwap_latest:+.2f}**")
     st.caption(f"VWAP15-period: **{vwap_latest:,.2f}** •  Spot: **{spot:,.2f}** •  Diff: **{spot - vwap_latest:+.2f}**")
 else:
     st.caption("VWAP or Spot not available yet. Check logs if this persists.")
@@ -1267,69 +1231,38 @@ st.dataframe(
     use_container_width=True
 )
 
-# ── Intraday Imbalance trend (09:15–16:00) ──────────────────────────────
 df_trend = mem.intraday.to_dataframe()
 
 if df_trend.empty:
     st.info("Imbalance trend will appear after 09:15 IST once data accumulates.")
 else:
-    # Keep only session window
     df_trend = df_trend.between_time("09:15", "16:00")
-
-    if df_trend.empty:
-        st.info("No points yet for today after 09:15 IST.")
-    else:
-        # Decide which y column we actually have
+    if not df_trend.empty:
         ycol = "imbalance_pct" if "imbalance_pct" in df_trend.columns else "imb"
-
-        # Reset index so Plotly gets a proper time column; make time tz-naive
-        df_plot = (
-            df_trend
-            .reset_index()                       # 'ts' becomes a column
-            .rename(columns={"ts": "Time", ycol: "Imbalance %"})
-        )
-        # Ensure Time is naive datetime for Plotly
+        df_plot = df_trend.reset_index().rename(columns={"ts": "Time", ycol: "Imbalance %"})
         if pd.api.types.is_datetime64_any_dtype(df_plot["Time"]):
             if getattr(df_plot["Time"].dt, "tz", None) is not None:
                 df_plot["Time"] = df_plot["Time"].dt.tz_convert("Asia/Kolkata").dt.tz_localize(None)
 
-        # Build figure
-        fig_trend = px.line(
-            df_plot,
-            x="Time",
-            y="Imbalance %",
-            title="Intraday Imbalance % (live)",
-            markers=True,
-        )
+        fig_trend = px.line(df_plot, x="Time", y="Imbalance %", title="Intraday Imbalance % (live)", markers=True)
 
-        # Symmetric Y range in steps of 10
         y_min = float(df_plot["Imbalance %"].min())
         y_max = float(df_plot["Imbalance %"].max())
         yabs = max(abs(y_min), abs(y_max))
-        ycap = max(10, math.ceil(yabs / 10.0) * 10)  # at least ±10
+        ycap = max(10, math.ceil(yabs / 10.0) * 10)
 
         fig_trend.update_layout(
             xaxis_title="Time (IST)",
             yaxis_title="Imbalance %",
-            yaxis=dict(
-                range=[-ycap, ycap],
-                dtick=10,
-                tick0=0,
-                ticksuffix="%",
-                zeroline=True,
-                zerolinewidth=1,
-            ),
+            yaxis=dict(range=[-ycap, ycap], dtick=10, tick0=0, ticksuffix="%", zeroline=True, zerolinewidth=1),
             margin=dict(t=60, r=20, l=20, b=40),
             height=350,
         )
-
         st.plotly_chart(fig_trend, use_container_width=True)
 
-# ── Signal History Table ──────────────────────────────────────────────────
 st.divider()
 st.subheader("📊 Buy Signal History (Today)")
 
-# Ensure signal_history exists (for backward compatibility with cached objects)
 if not hasattr(mem, 'signal_history'):
     mem.signal_history = SignalHistory()
 
@@ -1337,19 +1270,11 @@ signal_df = mem.signal_history.to_dataframe()
 if signal_df.empty:
     st.info("No buy signals recorded today. Signals will appear here when VWAP conditions are met.")
 else:
-    # Display the signals in reverse chronological order (latest first)
     display_df = signal_df.iloc[::-1].copy()
-
-    # Format the display columns
-    display_columns = [
-        'ID', 'Time (IST)', 'Time (UAE)', 'Signal', 'Spot Price', 'VWAP',
-        'Difference', 'ATM Strike', 'Expiry', 'OI Imbalance %', 'Telegram Sent'
-    ]
-
     display_df_formatted = pd.DataFrame({
         'ID': display_df['id'],
-        'Time (IST)': display_df['timestamp_ist'].str.split(' ').str[1],  # Show only time part
-        'Time (UAE)': display_df['timestamp_uae'].str.split(' ').str[1],  # Show only time part
+        'Time (IST)': display_df['timestamp_ist'].str.split(' ').str[1],
+        'Time (UAE)': display_df['timestamp_uae'].str.split(' ').str[1],
         'Signal': display_df['suggestion'],
         'Spot Price': display_df['spot_price'].apply(lambda x: f"₹{x:,.2f}"),
         'VWAP': display_df['vwap'].apply(lambda x: f"₹{x:,.2f}"),
@@ -1359,10 +1284,8 @@ else:
         'OI Imbalance %': display_df['imbalance_pct'].apply(lambda x: f"{x:+.2f}%"),
         'Telegram Sent': display_df['telegram_sent'].apply(lambda x: "✅" if x else "❌")
     })
-
     st.dataframe(display_df_formatted, use_container_width=True, hide_index=True)
 
-    # Summary stats
     total_signals = len(display_df)
     telegram_success = display_df['telegram_sent'].sum()
     col1, col2, col3, col4 = st.columns(4)
@@ -1371,7 +1294,6 @@ else:
     col3.metric("Success Rate", f"{(telegram_success/total_signals*100):.1f}%" if total_signals > 0 else "0%")
     col4.metric("Last Signal", display_df.iloc[0]['timestamp_ist'].split(' ')[1] if total_signals > 0 else "None")
 
-# Footer
 st.divider()
 col_footer1, col_footer2, col_footer3 = st.columns([2, 1, 1])
 
@@ -1381,7 +1303,6 @@ with col_footer1:
 
 with col_footer2:
     if st.button("📝 View Changelog", help="View complete version history and changes"):
-        # Read and display changelog content
         try:
             changelog_content = CHANGELOG_PATH.read_text(encoding="utf-8")
             st.text_area("📝 Changelog", changelog_content, height=400, help="Complete version history")
